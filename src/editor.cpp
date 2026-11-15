@@ -1028,7 +1028,7 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
     // Ctrl paging: D/U are half a page, F/B a full page.
     if (k.ctrl)
     {
-        const std::size_t half = rows / 2;
+        const std::size_t half = std::max<std::size_t>(1, rows / 2); // at least one line
         std::size_t step = 0;
         bool down = false;
         switch (k.ch)
