@@ -242,9 +242,15 @@ void VimEditor::enterInsert(bool afterCursor, bool openLineBelow, bool openLineA
 
 void VimEditor::exitInsert()
 {
+    // Vim leaves the cursor on the last character the insert session produced.
+    // Nothing typed means there is nothing to step back onto. The pre-session
+    // text is the snapshot beginEdit() took, which is exactly "did the session
+    // change anything" — native (IME/widget) typing counts too.
+    const std::wstring preSession = m_undo.empty() ? std::wstring() : m_undo.back().text;
+    const bool typed = m_text != preSession;
     endEdit();
-    if (m_cursor.col > 0 && m_cursor.col > lastCharCol(m_cursor.line))
-        --m_cursor.col; // Esc steps back onto the last char, as vim does
+    if (typed && m_cursor.col > 0)
+        --m_cursor.col;
     m_mode = Mode::Normal;
     m_desiredCol = m_cursor.col;
     syncCursorAndSelection();

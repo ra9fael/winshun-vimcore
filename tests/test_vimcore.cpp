@@ -423,6 +423,30 @@ TEST_CASE(ReplaceNeedsCharArgument)
     CHECK_EQ(doc.m_text, std::wstring(L"Xbc"));
 }
 
+TEST_CASE(AppendThenEscapeLandsOnLastTypedChar)
+{
+    // vim: iX<Esc> puts the cursor on the X, so a following x deletes it.
+    FakeDocument doc(L"abc");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    editor.key(vc::makeChar(L'X'));
+    editor.key(esc());
+    CHECK_EQ(doc.m_cursor.col, std::size_t{0}); // on the typed X
+    editor.key(vc::makeChar(L'x'));
+    CHECK_EQ(doc.m_text, std::wstring(L"abc"));
+}
+
+TEST_CASE(EscapeWithNothingTypedKeepsTheCaret)
+{
+    FakeDocument doc(L"abc", {0, 1});
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    editor.key(esc());
+    CHECK_EQ(editor.mode(), vc::Mode::Normal);
+    CHECK_EQ(doc.m_cursor.col, std::size_t{1}); // nothing typed: no step back
+    CHECK_EQ(doc.m_text, std::wstring(L"abc"));
+}
+
 // ---- undo / redo ----------------------------------------------------------------
 
 TEST_CASE(UndoRestoresText)
