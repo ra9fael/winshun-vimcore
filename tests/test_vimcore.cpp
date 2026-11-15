@@ -691,6 +691,99 @@ TEST_CASE(EmptyBufferIsSafe)
     CHECK_EQ(doc.m_text, std::wstring(L""));
 }
 
+// ---- external changes (refreshFromDocument) ------------------------------------
+
+TEST_CASE(RefreshFromDocumentKeepsInsertMode)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    CHECK(editor.mode() == vc::Mode::Insert);
+
+    // The host (or IME) typed behind the core's back.
+    doc.m_text = L"XYab";
+    doc.m_cursor = {0, 2};
+    editor.refreshFromDocument();
+
+    CHECK(editor.mode() == vc::Mode::Insert); // still inserting, not reset
+    editor.key(vc::makeChar(L'Z'));
+    editor.key(esc());
+    CHECK_EQ(doc.m_text, std::wstring(L"XYZab")); // inserted at the caret
+    CHECK(editor.mode() == vc::Mode::Normal);
+}
+
+TEST_CASE(NativeInsertIsOneUndoStep)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    doc.m_text = L"Xab";
+    doc.m_cursor = {0, 1};
+    editor.refreshFromDocument();
+    doc.m_text = L"XYab";
+    doc.m_cursor = {0, 2};
+    editor.refreshFromDocument();
+    editor.key(esc());
+
+    CHECK_EQ(doc.m_text, std::wstring(L"XYab"));
+    editor.key(vc::makeChar(L'u'));
+    CHECK_EQ(doc.m_text, std::wstring(L"ab")); // both native chars undone together
+    editor.key(ctrlR());
+    CHECK_EQ(doc.m_text, std::wstring(L"XYab"));
+}
+
+TEST_CASE(NormalEditsUseTheRefreshedText)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    doc.m_text = L"hello ab";
+    doc.m_cursor = {0, 8};
+    editor.refreshFromDocument();
+    editor.key(esc());
+    editor.key(vc::makeChar(L'$'));
+    editor.key(vc::makeChar(L'x'));
+    CHECK_EQ(doc.m_text, std::wstring(L"hello a")); // deleted 'b', not a stale offset
+}
+
+TEST_CASE(RefreshDropsPendingOperator)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'd'));
+    doc.m_text = L"abc";
+    doc.m_cursor = {0, 1};
+    editor.refreshFromDocument();
+    // 'd' was pending; after a native change the next key must not be treated
+    // as its motion (that would delete text the user did not ask for).
+    editor.key(vc::makeChar(L'd'));
+    CHECK_EQ(doc.m_text, std::wstring(L"abc"));
+}
+
+TEST_CASE(RefreshOutsideBatchSyncsText)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    doc.m_text = L"abX";
+    doc.m_cursor = {0, 2};
+    editor.refreshFromDocument(); // native change while in Normal mode
+    editor.key(vc::makeChar(L'$'));
+    editor.key(vc::makeChar(L'x'));
+    CHECK_EQ(doc.m_text, std::wstring(L"ab"));
+}
+
+TEST_CASE(RefreshIsANoOpWhenTextMatches)
+{
+    FakeDocument doc(L"ab");
+    vc::VimEditor editor(doc);
+    editor.key(vc::makeChar(L'i'));
+    editor.refreshFromDocument(); // nothing changed natively
+    CHECK(editor.mode() == vc::Mode::Insert);
+    editor.key(vc::makeChar(L'Z'));
+    editor.key(esc());
+    CHECK_EQ(doc.m_text, std::wstring(L"Zab"));
+}
+
 int main()
 {
     return vim_test::runAll();

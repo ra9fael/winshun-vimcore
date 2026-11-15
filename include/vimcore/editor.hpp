@@ -31,6 +31,13 @@ public:
     void key(const Key& k);
     void keys(const std::vector<Key>& ks) { for (const Key& k : ks) key(k); }
 
+    // Re-read text and cursor from the Document after it changed behind the
+    // editor's back — native insert-mode typing, IME commits, pastes. Mode and
+    // the open insert batch survive; operator/find pending state is dropped,
+    // since the user's fingers were on the widget, not on vim keys. A no-op
+    // when the document already matches the editor's copy.
+    void refreshFromDocument();
+
     Mode mode() const { return m_mode; }
     // The yank register contents; exposed for tests and hosts that want a
     // system-clipboard bridge.

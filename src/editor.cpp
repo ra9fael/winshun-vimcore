@@ -473,6 +473,43 @@ void VimEditor::doRedo()
     syncCursorAndSelection();
 }
 
+// ---- external changes -----------------------------------------------------------
+
+void VimEditor::refreshFromDocument()
+{
+    const std::wstring external = m_doc.text();
+    if (external == m_text)
+        return; // our own apply already echoed back; keep cursor and state
+
+    const Mode keepMode = m_mode;
+    const bool keepEditing = m_editing;
+
+    m_text = external;
+    m_cursor = m_doc.cursor();
+    m_mode = keepMode;
+    clampCursor();
+    m_desiredCol = m_cursor.col;
+
+    if (keepEditing)
+    {
+        // The open insert batch continues, but its diff baseline moves to the
+        // text as it actually is now: the native typing is part of this batch,
+        // and the snapshot taken at beginEdit() still undoes all of it.
+        m_savedText = m_text;
+        m_savedCursor = m_cursor;
+    }
+    else
+        ; // Outside an open batch there is no pre-change snapshot to infer; the
+          // host remains the source of truth, and future vim edits are undoable.
+
+    // The user typed in the widget; vim key state cannot carry over.
+    m_operator = L'\0';
+    m_pending = Pending::None;
+    m_count = 1;
+    m_countActive = false;
+    syncCursorAndSelection();
+}
+
 // ---- motions --------------------------------------------------------------------
 
 Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCount)
