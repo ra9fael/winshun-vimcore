@@ -3,7 +3,8 @@
 // One VimEditor drives one Document. Feed keys with key(); every key either
 // mutates the document through exactly one apply() call or only moves the
 // cursor / changes mode. The class owns: mode, pending operator, pending
-// find (f/F/t/T), pending replace (r), counts, yank register, undo/redo.
+// find (f/F/t/T), pending replace (r), counts, yank register, undo/redo,
+// dot-repeat recording, and Replace mode.
 //
 // Not implemented on purpose (README documents this): ex commands, named
 // registers, macros, marks, search, the g prefix beyond gg, multiple buffers.
@@ -18,10 +19,13 @@
 
 namespace vimcore {
 
-enum class Mode { Normal, Insert, Visual, VisualLine };
+enum class Mode { Normal, Insert, Replace, Visual, VisualLine };
 
 struct EditorOptions {
     std::size_t undoDepth = 1000;
+    // Window height in text rows, for Ctrl-D/U (half page) and Ctrl-F/B and
+    // PageUp/PageDown (full page). Hosts update it when the view resizes.
+    std::size_t viewportRows = 20;
 };
 
 class VimEditor {
@@ -30,6 +34,9 @@ public:
 
     void key(const Key& k);
     void keys(const std::vector<Key>& ks) { for (const Key& k : ks) key(k); }
+
+    // Rows of the host's visible viewport; drives Ctrl-D/U/F/B and PageUp/Down.
+    void setViewportRows(std::size_t rows) { m_options.viewportRows = rows < 1 ? 1 : rows; }
 
     // Re-read text and cursor from the Document after it changed behind the
     // editor's back — native insert-mode typing, IME commits, pastes. Mode and
@@ -60,8 +67,11 @@ private:
     // --- key handling stages -------------------------------------------------
     void handleNormal(const Key& k);
     void handleInsert(const Key& k);
+    void handleReplace(const Key& k);
     void handleVisual(const Key& k);
     void handlePending(const Key& k);      // f/F/t/T/r/gg waiting for their char
+    void handleInsertMotion(const Key& k); // arrow/Home/End caret moves while editing
+    void dispatch(const Key& k);           // key() minus the '.'-recording wrapper
 
     // A batch is one undo step. beginEdit() opens one (and snapshots), each
     // mutating key flushes its diff, and endEdit() closes it.
@@ -77,8 +87,12 @@ private:
     // 1G (line 1). Non-const: it records whether the motion ran out of text.
     Cursor motionApply(Cursor from, const Key& k, int count, bool hasCount);
 
-    void enterInsert(bool afterCursor, bool openLineBelow = false, bool openLineAbove = false);
+    void enterInsert(bool afterCursor, bool openLineBelow = false, bool openLineAbove = false,
+                     int repeat = 1);
     void exitInsert();
+    void enterReplace(int repeat = 1);
+    void exitReplace();
+    void overwriteAtCursor(wchar_t ch);
 
     void operatorDelete(std::size_t start, std::size_t end, bool linewise);
     void operatorChange(std::size_t start, std::size_t end, bool linewise);
@@ -90,6 +104,16 @@ private:
     void adjustCursorAfterDelete();
     void doUndo();
     void doRedo();
+
+    // Helpers for the commands beyond the original core.
+    bool adjustNumber(int delta, int count);                    // Ctrl-A / Ctrl-X
+    std::optional<std::size_t> bracketMatchCol(std::size_t line, std::size_t col) const;
+    bool wordRange(std::size_t& start, std::size_t& end, bool around) const; // iw / aw
+    void applyCase(std::size_t start, std::size_t end, int op); // 0 lower 1 upper 2 toggle
+    void visualPaste();
+    void visualJoin();
+    std::size_t firstNonBlankCol(std::size_t line) const;
+    void commitReplay();
 
     // Range for operator + motion, absolute offsets. `total` already combines
     // the operator count and the motion count.
@@ -108,6 +132,9 @@ private:
 
     enum class Pending { None, Find, FindBack, Till, TillBack, Replace, GG };
     Pending m_pending = Pending::None;
+
+    enum class Object { None, InnerWord, AWord };
+    Object m_object = Object::None;        // iw/aw chosen, waiting for the object char
 
     Cursor m_visualAnchor;                 // where v/V was pressed
 
@@ -131,6 +158,22 @@ private:
     };
     std::vector<Snapshot> m_undo;
     std::vector<Snapshot> m_redo;
+
+    // --- insert/replace session state (counts, '.' replay) -------------------
+    std::wstring m_sessionTyped;           // characters typed this session
+    int m_sessionRepeat = 1;               // 3i / 3R repeat the session count times
+    bool m_sessionOpenLine = false;        // o/O: the repeat opens more lines
+    std::vector<std::pair<std::size_t, wchar_t>> m_replaced; // Replace-mode BS restores
+
+    // --- '.' replay ----------------------------------------------------------
+    // Keys accumulate in m_replayBuffer until a batch closes; the buffer then
+    // becomes m_lastChange, which '.' feeds back through key(). Native typing
+    // reaches the buffer through refreshFromDocument().
+    std::vector<Key> m_replayBuffer;
+    std::vector<Key> m_lastChange;
+    bool m_replaying = false;
+    bool m_batchClosed = false;
+    bool m_suppressRecord = false;
 };
 
 } // namespace vimcore

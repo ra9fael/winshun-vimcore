@@ -10,6 +10,7 @@
 #include "vimcore/editor.hpp"
 
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 
 namespace vimcore {
@@ -117,8 +118,9 @@ void VimEditor::clampCursor()
 {
     if (m_cursor.line >= lineCount())
         m_cursor.line = lineCount() - 1;
-    const std::size_t max = m_mode == Mode::Insert ? lineLength(m_cursor.line)
-                                                   : lastCharCol(m_cursor.line);
+    const bool pastEndOk = m_mode == Mode::Insert || m_mode == Mode::Replace;
+    const std::size_t max = pastEndOk ? lineLength(m_cursor.line)
+                                      : lastCharCol(m_cursor.line);
     if (m_cursor.col > max)
         m_cursor.col = max;
 }
@@ -150,6 +152,7 @@ void VimEditor::syncCursorAndSelection()
     {
     case Mode::Normal:     m_doc.setStatus(L"-- NORMAL --"); break;
     case Mode::Insert:     m_doc.setStatus(L"-- INSERT --"); break;
+    case Mode::Replace:    m_doc.setStatus(L"-- REPLACE --"); break;
     case Mode::Visual:     m_doc.setStatus(L"-- VISUAL --"); break;
     case Mode::VisualLine: m_doc.setStatus(L"-- VISUAL LINE --"); break;
     }
@@ -207,14 +210,29 @@ void VimEditor::flushEdit()
 void VimEditor::endEdit()
 {
     flushEdit();
+    if (m_editing)
+        m_batchClosed = true;
     m_editing = false;
+}
+
+// ---- '.' replay -------------------------------------------------------------
+
+void VimEditor::commitReplay()
+{
+    if (m_replayBuffer.empty())
+        return;
+    m_lastChange = m_replayBuffer;
+    m_replayBuffer.clear();
 }
 
 // ---- mode transitions ----------------------------------------------------------
 
-void VimEditor::enterInsert(bool afterCursor, bool openLineBelow, bool openLineAbove)
+void VimEditor::enterInsert(bool afterCursor, bool openLineBelow, bool openLineAbove, int repeat)
 {
     beginEdit();
+    m_sessionRepeat = repeat < 1 ? 1 : repeat;
+    m_sessionTyped.clear();
+    m_sessionOpenLine = openLineBelow || openLineAbove;
     if (openLineBelow)
     {
         const std::size_t at = lineStart(m_cursor.line) + lineLength(m_cursor.line);
@@ -242,18 +260,189 @@ void VimEditor::enterInsert(bool afterCursor, bool openLineBelow, bool openLineA
 
 void VimEditor::exitInsert()
 {
+    // {count}i repeats the typed text count times; {count}o opens count lines.
+    // Both happen before the batch closes so the whole thing stays one undo.
+    const std::wstring typed = m_sessionTyped;
+    const int repeat = m_sessionRepeat;
+    const bool openLine = m_sessionOpenLine;
+    m_sessionTyped.clear();
+    m_sessionRepeat = 1;
+    m_sessionOpenLine = false;
+
+    if (repeat > 1 && !typed.empty())
+    {
+        if (openLine)
+        {
+            for (int i = 1; i < repeat; ++i)
+            {
+                const std::size_t at = lineStart(m_cursor.line) + lineLength(m_cursor.line);
+                m_text.insert(at, L"\n" + typed);
+                ++m_cursor.line;
+                m_cursor.col = typed.size();
+            }
+        }
+        else
+        {
+            for (int i = 1; i < repeat; ++i)
+            {
+                for (const wchar_t ch : typed)
+                {
+                    m_text.insert(offset(m_cursor.line, m_cursor.col), 1, ch);
+                    ++m_cursor.col;
+                }
+            }
+        }
+    }
+
     // Vim leaves the cursor on the last character the insert session produced.
     // Nothing typed means there is nothing to step back onto. The pre-session
     // text is the snapshot beginEdit() took, which is exactly "did the session
     // change anything" — native (IME/widget) typing counts too.
     const std::wstring preSession = m_undo.empty() ? std::wstring() : m_undo.back().text;
-    const bool typed = m_text != preSession;
+    const bool typedAnything = m_text != preSession;
     endEdit();
-    if (typed && m_cursor.col > 0)
+    if (typedAnything && m_cursor.col > 0)
         --m_cursor.col;
     m_mode = Mode::Normal;
     m_desiredCol = m_cursor.col;
     syncCursorAndSelection();
+}
+
+// ---- Replace mode ----------------------------------------------------------------
+
+void VimEditor::enterReplace(int repeat)
+{
+    beginEdit();
+    m_sessionRepeat = repeat < 1 ? 1 : repeat;
+    m_sessionTyped.clear();
+    m_replaced.clear();
+    m_mode = Mode::Replace;
+    m_desiredCol = m_cursor.col;
+    flushEdit();
+    syncCursorAndSelection();
+}
+
+void VimEditor::overwriteAtCursor(wchar_t ch)
+{
+    const std::size_t at = offset(m_cursor.line, m_cursor.col);
+    if (at < m_text.size() && !isLineBreak(m_text[at]))
+    {
+        m_replaced.push_back({at, m_text[at]});
+        m_text[at] = ch;
+    }
+    else
+        m_text.insert(at, 1, ch); // past end of line: append, like vim
+    ++m_cursor.col;
+    m_sessionTyped += ch;
+    m_desiredCol = m_cursor.col;
+}
+
+void VimEditor::exitReplace()
+{
+    // {count}R repeats the typed text count times before the batch closes.
+    const std::wstring typed = m_sessionTyped;
+    const int repeat = m_sessionRepeat;
+    m_sessionTyped.clear();
+    m_sessionRepeat = 1;
+    if (repeat > 1 && !typed.empty())
+    {
+        for (int i = 1; i < repeat; ++i)
+        {
+            for (const wchar_t ch : typed)
+                overwriteAtCursor(ch);
+        }
+    }
+    m_replaced.clear();
+
+    const std::wstring preSession = m_undo.empty() ? std::wstring() : m_undo.back().text;
+    const bool typedAnything = m_text != preSession;
+    endEdit();
+    if (typedAnything && m_cursor.col > 0)
+        --m_cursor.col;
+    m_mode = Mode::Normal;
+    m_desiredCol = m_cursor.col;
+    syncCursorAndSelection();
+}
+
+void VimEditor::handleReplace(const Key& k)
+{
+    switch (k.name)
+    {
+    case KeyName::Esc:
+        exitReplace();
+        return;
+    case KeyName::Left: case KeyName::Right: case KeyName::Up: case KeyName::Down:
+    case KeyName::Home: case KeyName::End:
+        // Same caret rules as insert mode.
+        {
+            Key insertKey = k;
+            handleInsertMotion(insertKey);
+        }
+        return;
+    case KeyName::Backspace:
+    {
+        if (!m_replaced.empty())
+        {
+            // Restore the character this session overwrote, newest first.
+            const auto last = m_replaced.back();
+            m_replaced.pop_back();
+            m_text[last.first] = last.second;
+            m_cursor = cursorFor(last.first);
+            if (!m_sessionTyped.empty())
+                m_sessionTyped.pop_back();
+        }
+        else if (m_cursor.col > 0)
+        {
+            --m_cursor.col; // nothing of ours to restore: just move left
+        }
+        m_desiredCol = m_cursor.col;
+        flushEdit();
+        syncCursorAndSelection();
+        return;
+    }
+    case KeyName::Enter:
+    {
+        m_text.insert(offset(m_cursor.line, m_cursor.col), L"\n");
+        ++m_cursor.line;
+        m_cursor.col = 0;
+        m_sessionTyped += L'\n';
+        m_desiredCol = 0;
+        flushEdit();
+        syncCursorAndSelection();
+        return;
+    }
+    case KeyName::Delete:
+    {
+        const std::size_t at = offset(m_cursor.line, m_cursor.col);
+        if (at < m_text.size())
+        {
+            m_text.erase(at, 1);
+            flushEdit();
+            syncCursorAndSelection();
+        }
+        return;
+    }
+    case KeyName::Tab:
+    {
+        m_text.insert(offset(m_cursor.line, m_cursor.col), L"    ");
+        m_cursor.col += 4;
+        m_sessionTyped += L"    ";
+        m_desiredCol = m_cursor.col;
+        flushEdit();
+        syncCursorAndSelection();
+        return;
+    }
+    case KeyName::Char:
+        if (!k.ctrl)
+        {
+            overwriteAtCursor(k.ch);
+            flushEdit();
+            syncCursorAndSelection();
+        }
+        return;
+    default:
+        return;
+    }
 }
 
 // ---- operators ------------------------------------------------------------------
@@ -441,12 +630,236 @@ void VimEditor::adjustCursorAfterDelete()
     m_desiredCol = m_cursor.col;
 }
 
+// ---- helpers for the extended commands -------------------------------------------
+
+bool VimEditor::adjustNumber(int delta, int count)
+{
+    const std::size_t ls = lineStart(m_cursor.line);
+    const std::size_t len = lineLength(m_cursor.line);
+    if (len == 0)
+        return false;
+    const std::wstring line = m_text.substr(ls, len);
+    std::size_t col = std::min(m_cursor.col, len - 1);
+
+    std::size_t digits = std::size_t(-1); // index of the first digit
+    if (line[col] == L'-' && col + 1 < len && iswdigit(line[col + 1]))
+        digits = col + 1; // cursor sits on the sign of the number
+    else
+    {
+        for (std::size_t i = col; i < len; ++i)
+        {
+            if (iswdigit(line[i]))
+            {
+                digits = i;
+                break;
+            }
+        }
+    }
+    if (digits == std::size_t(-1))
+        return false;
+
+    // A '-' belongs to this number only when it is not the tail of another.
+    bool negative = false;
+    std::size_t start = digits;
+    if (digits > 0 && line[digits - 1] == L'-'
+        && !(digits >= 2 && iswdigit(line[digits - 2])))
+    {
+        negative = true;
+        start = digits - 1;
+    }
+
+    std::size_t end = digits;
+    while (end < len && iswdigit(line[end]))
+        ++end;
+    long long value = 0;
+    for (std::size_t i = digits; i < end; ++i)
+        value = value * 10 + (line[i] - L'0');
+    const std::size_t width = end - digits;
+    const bool padded = width > 1 && line[digits] == L'0';
+
+    const long long result =
+        (negative ? -value : value) + static_cast<long long>(delta) * count;
+    const bool newNegative = result < 0;
+    const unsigned long long magnitude = newNegative
+        ? static_cast<unsigned long long>(-result)
+        : static_cast<unsigned long long>(result);
+    std::wstring digitsText = std::to_wstring(magnitude);
+    if (padded && digitsText.size() < width)
+        digitsText.insert(0, width - digitsText.size(), L'0');
+    const std::wstring number = (newNegative ? std::wstring(L"-") : std::wstring()) + digitsText;
+
+    beginEdit();
+    m_text.replace(ls + start, end - start, number);
+    endEdit();
+    m_cursor.col = start + number.size() - 1; // vim lands on the last digit
+    m_desiredCol = m_cursor.col;
+    syncCursorAndSelection();
+    return true;
+}
+
+std::optional<std::size_t> VimEditor::bracketMatchCol(std::size_t line, std::size_t col) const
+{
+    // Same-line bracket matching: the rename buffer is line-oriented, so this
+    // covers the realistic cases without a multi-line scan.
+    const std::wstring text = lineText(line);
+    if (col >= text.size())
+        return std::nullopt;
+    static const wchar_t* open = L"([{";
+    static const wchar_t* close = L")]}";
+    const wchar_t ch = text[col];
+    const wchar_t* opener = std::wcschr(open, ch);
+    const wchar_t* closer = std::wcschr(close, ch);
+    if (!opener && !closer)
+        return std::nullopt;
+    if (opener)
+    {
+        const wchar_t want = close[opener - open];
+        int depth = 0;
+        for (std::size_t i = col; i < text.size(); ++i)
+        {
+            if (text[i] == ch)
+                ++depth;
+            else if (text[i] == want && --depth == 0)
+                return i;
+        }
+        return std::nullopt;
+    }
+    const wchar_t want = open[closer - close];
+    int depth = 0;
+    for (std::size_t i = col + 1; i-- > 0;)
+    {
+        if (text[i] == ch)
+            ++depth;
+        else if (text[i] == want && --depth == 0)
+            return i;
+    }
+    return std::nullopt;
+}
+
+bool VimEditor::wordRange(std::size_t& start, std::size_t& end, bool around) const
+{
+    const std::size_t ls = lineStart(m_cursor.line);
+    const std::size_t len = lineLength(m_cursor.line);
+    if (len == 0)
+        return false;
+    const std::size_t col = std::min(m_cursor.col, len - 1);
+    const auto classify = [](wchar_t ch) {
+        if (isSpaceChar(ch))
+            return 0;
+        return isWordChar(ch) ? 1 : 2; // word / punctuation
+    };
+    const int cls = classify(m_text[ls + col]);
+    std::size_t b = col;
+    while (b > 0 && classify(m_text[ls + b - 1]) == cls)
+        --b;
+    std::size_t e = col;
+    while (e < len && classify(m_text[ls + e]) == cls)
+        ++e;
+    if (around)
+    {
+        // "aw" prefers the whitespace after the word; at the end of the line it
+        // takes the run before it instead.
+        std::size_t t = e;
+        while (t < len && isSpaceChar(m_text[ls + t]))
+            ++t;
+        if (t > e)
+            e = t;
+        else
+        {
+            while (b > 0 && isSpaceChar(m_text[ls + b - 1]))
+                --b;
+        }
+    }
+    start = ls + b;
+    end = ls + e;
+    return true;
+}
+
+void VimEditor::applyCase(std::size_t start, std::size_t end, int op)
+{
+    if (end <= start)
+        return;
+    beginEdit();
+    for (std::size_t i = start; i < end && i < m_text.size(); ++i)
+    {
+        wchar_t ch = m_text[i];
+        if (op == 0)
+            ch = static_cast<wchar_t>(towlower(ch));
+        else if (op == 1)
+            ch = static_cast<wchar_t>(towupper(ch));
+        else
+            ch = iswupper(ch) ? static_cast<wchar_t>(towlower(ch))
+                              : static_cast<wchar_t>(towupper(ch));
+        m_text[i] = ch;
+    }
+    endEdit();
+}
+
+void VimEditor::visualPaste()
+{
+    if (m_register.empty())
+        return;
+    const std::size_t anchor = offset(m_visualAnchor.line, m_visualAnchor.col);
+    const std::size_t head = offset(m_cursor.line, m_cursor.col);
+    const bool lineWise = m_mode == Mode::VisualLine;
+    std::size_t start = std::min(anchor, head);
+    std::size_t end = std::max(anchor, head) + 1;
+    if (lineWise)
+    {
+        const std::size_t fromLine = cursorFor(start).line;
+        const std::size_t toLine = cursorFor(std::max(anchor, head)).line;
+        start = lineStart(fromLine);
+        end = lineStart(toLine) + lineLength(toLine) + (toLine + 1 < lineCount() ? 1 : 0);
+    }
+    if (end > m_text.size())
+        end = m_text.size();
+
+    const std::wstring taken = m_text.substr(start, end - start);
+    std::wstring block = m_register;
+    if (lineWise)
+    {
+        // A linewise selection is replaced by whole lines, newline included.
+        if (!block.empty() && block.back() != L'\n')
+            block += L'\n';
+    }
+    beginEdit();
+    m_text.replace(start, end - start, block);
+    m_register = taken; // vim swaps: the replaced text becomes the register
+    m_lastYankLineWise = lineWise;
+    if (lineWise)
+    {
+        m_cursor = cursorFor(start);
+        m_cursor.col = firstNonBlankCol(m_cursor.line);
+    }
+    else
+        m_cursor = cursorFor(block.empty() ? start : start + block.size() - 1);
+    m_desiredCol = m_cursor.col;
+    m_mode = Mode::Normal;
+    endEdit();
+    syncCursorAndSelection();
+}
+
+void VimEditor::visualJoin()
+{
+    const std::size_t anchor = offset(m_visualAnchor.line, m_visualAnchor.col);
+    const std::size_t head = offset(m_cursor.line, m_cursor.col);
+    const std::size_t fromLine = std::min(cursorFor(anchor).line, cursorFor(head).line);
+    const std::size_t toLine = std::max(cursorFor(anchor).line, cursorFor(head).line);
+    const std::size_t joins = toLine - fromLine;
+    m_cursor = {fromLine, m_cursor.col};
+    for (std::size_t i = 0; i < joins; ++i)
+        joinWithNext();
+    m_mode = Mode::Normal;
+    syncCursorAndSelection();
+}
+
 // ---- undo / redo ----------------------------------------------------------------
 
 void VimEditor::doUndo()
 {
     if (m_undo.empty())
         return;
+    m_suppressRecord = true;
     endEdit(); // close any open batch first
     m_redo.push_back({m_text, m_cursor});
     const Snapshot snap = m_undo.back();
@@ -465,6 +878,7 @@ void VimEditor::doRedo()
 {
     if (m_redo.empty())
         return;
+    m_suppressRecord = true;
     endEdit();
     m_undo.push_back({m_text, m_cursor});
     const Snapshot snap = m_redo.back();
@@ -487,6 +901,7 @@ void VimEditor::refreshFromDocument()
     if (external == m_text)
         return; // our own apply already echoed back; keep cursor and state
 
+    const std::wstring oldText = m_text;
     const Mode keepMode = m_mode;
     const bool keepEditing = m_editing;
 
@@ -503,13 +918,38 @@ void VimEditor::refreshFromDocument()
         // and the snapshot taken at beginEdit() still undoes all of it.
         m_savedText = m_text;
         m_savedCursor = m_cursor;
+
+        // Remember what the host typed so {count}i repeats it and '.' can
+        // replay the session.
+        if (!m_replaying && !m_suppressRecord)
+        {
+            std::size_t prefix = 0;
+            while (prefix < oldText.size() && prefix < m_text.size()
+                   && oldText[prefix] == m_text[prefix])
+                ++prefix;
+            std::size_t suffix = 0;
+            while (suffix < oldText.size() - prefix && suffix < m_text.size() - prefix
+                   && oldText[oldText.size() - 1 - suffix]
+                      == m_text[m_text.size() - 1 - suffix])
+                ++suffix;
+            const std::wstring typed =
+                m_text.substr(prefix, m_text.size() - suffix - prefix);
+            m_sessionTyped += typed;
+            for (const wchar_t ch : typed)
+                m_replayBuffer.push_back(makeChar(ch));
+        }
     }
     else
-        ; // Outside an open batch there is no pre-change snapshot to infer; the
-          // host remains the source of truth, and future vim edits are undoable.
+    {
+        // Outside an open batch there is no pre-change snapshot to infer; the
+        // host remains the source of truth, and future vim edits are undoable.
+        // A half-typed '.' replay is stale now, so drop it.
+        m_replayBuffer.clear();
+    }
 
     // The user typed in the widget; vim key state cannot carry over.
     m_operator = L'\0';
+    m_object = Object::None;
     m_pending = Pending::None;
     m_count = 1;
     m_countActive = false;
@@ -523,10 +963,17 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
     Cursor c = from;
     const int n = count < 1 ? 1 : count;
     m_motionRanOut = false;
+    const std::size_t rows = m_options.viewportRows < 2 ? 2 : m_options.viewportRows;
 
     switch (k.name)
     {
     case KeyName::Left:
+        // h and <Left> stay on the line; vim's whichwrap does not include them.
+        if (c.col > 0)
+            c.col -= std::min<std::size_t>(static_cast<std::size_t>(n), c.col);
+        break;
+    case KeyName::Backspace:
+        // <BS> is the one backward motion that wraps (whichwrap 'b').
         for (int i = 0; i < n; ++i)
         {
             if (c.col > 0) --c.col;
@@ -534,11 +981,9 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
         }
         break;
     case KeyName::Right:
-        for (int i = 0; i < n; ++i)
-        {
-            if (c.col < lastCharCol(c.line)) ++c.col;
-            else if (c.line + 1 < lineCount()) { ++c.line; c.col = 0; }
-        }
+        if (c.col < lastCharCol(c.line))
+            c.col += std::min<std::size_t>(static_cast<std::size_t>(n),
+                                           lastCharCol(c.line) - c.col);
         break;
     case KeyName::Up:
         for (int i = 0; i < n && c.line > 0; ++i)
@@ -554,19 +999,21 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
         c.col = 0;
         break;
     case KeyName::End:
-        for (int i = 0; i < n && c.line + 1 < lineCount(); ++i)
+        // <End> is $: count-1 lines down, then the last character.
+        for (int i = 1; i < n && c.line + 1 < lineCount(); ++i)
             ++c.line;
         c.col = lastCharCol(c.line);
         break;
     case KeyName::PageUp:
-        for (int i = 0; i < n * 10 && c.line > 0; ++i)
+        for (std::size_t i = 0; i < rows * static_cast<std::size_t>(n) && c.line > 0; ++i)
             --c.line;
-        c.col = std::min(m_desiredCol, lastCharCol(c.line));
+        c.col = std::min(std::max(c.col, m_desiredCol), lastCharCol(c.line));
         break;
     case KeyName::PageDown:
-        for (int i = 0; i < n * 10 && c.line + 1 < lineCount(); ++i)
+        for (std::size_t i = 0;
+             i < rows * static_cast<std::size_t>(n) && c.line + 1 < lineCount(); ++i)
             ++c.line;
-        c.col = std::min(m_desiredCol, lastCharCol(c.line));
+        c.col = std::min(std::max(c.col, m_desiredCol), lastCharCol(c.line));
         break;
     default:
         break;
@@ -578,21 +1025,55 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
         return c;
     }
 
+    // Ctrl paging: D/U are half a page, F/B a full page.
+    if (k.ctrl)
+    {
+        const std::size_t half = rows / 2;
+        std::size_t step = 0;
+        bool down = false;
+        switch (k.ch)
+        {
+        case L'd': step = half * static_cast<std::size_t>(n); down = true; break;
+        case L'u': step = half * static_cast<std::size_t>(n); break;
+        case L'f': step = rows * static_cast<std::size_t>(n); down = true; break;
+        case L'b': step = rows * static_cast<std::size_t>(n); break;
+        default: return c;
+        }
+        for (std::size_t i = 0; i < step; ++i)
+        {
+            if (down && c.line + 1 < lineCount())
+                ++c.line;
+            else if (!down && c.line > 0)
+                --c.line;
+        }
+        c.col = std::min(std::max(c.col, m_desiredCol), lastCharCol(c.line));
+        if (c.col > lastCharCol(c.line)) c.col = lastCharCol(c.line);
+        return c;
+    }
+
     switch (k.ch)
     {
     case L'h':
-        for (int i = 0; i < n; ++i)
-        {
-            if (c.col > 0) --c.col;
-            else if (c.line > 0) { --c.line; c.col = lastCharCol(c.line); }
-        }
+        if (c.col > 0)
+            c.col -= std::min<std::size_t>(static_cast<std::size_t>(n), c.col);
         break;
-    case L'l':
+    case L' ':
+        // <Space> is the one horizontal motion that wraps (whichwrap 's').
         for (int i = 0; i < n; ++i)
         {
             if (c.col < lastCharCol(c.line)) ++c.col;
             else if (c.line + 1 < lineCount()) { ++c.line; c.col = 0; }
+            else
+            {
+                m_motionRanOut = true;
+                break;
+            }
         }
+        break;
+    case L'l':
+        if (c.col < lastCharCol(c.line))
+            c.col += std::min<std::size_t>(static_cast<std::size_t>(n),
+                                           lastCharCol(c.line) - c.col);
         break;
     case L'j':
         for (int i = 0; i < n && c.line + 1 < lineCount(); ++i)
@@ -608,25 +1089,26 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
         c.col = 0;
         break;
     case L'^':
-    {
-        const std::wstring line = lineText(c.line);
-        std::size_t i = 0;
-        while (i < line.size() && isSpaceChar(line[i]))
-            ++i;
-        c.col = i < line.size() ? i : 0;
+        c.col = firstNonBlankCol(c.line);
         break;
-    }
     case L'$':
-        for (int i = 0; i < n && c.line + 1 < lineCount(); ++i)
+        for (int i = 1; i < n && c.line + 1 < lineCount(); ++i)
             ++c.line;
         c.col = lastCharCol(c.line);
         break;
+    case L'%':
+    {
+        const std::optional<std::size_t> match = bracketMatchCol(c.line, c.col);
+        if (match)
+            c.col = *match;
+        break;
+    }
     case L'G':
         if (hasCount)
             c.line = std::min<std::size_t>(static_cast<std::size_t>(n) - 1, lineCount() - 1);
         else
             c.line = lineCount() - 1;
-        c.col = std::min(from.col, lastCharCol(c.line));
+        c.col = firstNonBlankCol(c.line);
         break;
     case L'w':
         for (int step = 0; step < n; ++step)
@@ -703,6 +1185,15 @@ Cursor VimEditor::motionApply(Cursor from, const Key& k, int count, bool hasCoun
     return c;
 }
 
+std::size_t VimEditor::firstNonBlankCol(std::size_t line) const
+{
+    const std::wstring text = lineText(line);
+    std::size_t i = 0;
+    while (i < text.size() && isSpaceChar(text[i]))
+        ++i;
+    return i < text.size() ? i : 0;
+}
+
 bool VimEditor::resolveRange(std::size_t& start, std::size_t& end, bool& linewise,
                              const Key& motion, int total)
 {
@@ -741,6 +1232,9 @@ bool VimEditor::resolveRange(std::size_t& start, std::size_t& end, bool& linewis
         return true;
     }
 
+    if (motion.ch == L'%' && !bracketMatchCol(m_cursor.line, m_cursor.col))
+        return false; // no match on this line: the operator is cancelled
+
     const Cursor target = motionApply(m_cursor, motion, total, total > 1);
     const std::size_t from = offset(m_cursor.line, m_cursor.col);
     const std::size_t to = offset(target.line, target.col);
@@ -759,9 +1253,10 @@ bool VimEditor::resolveRange(std::size_t& start, std::size_t& end, bool& linewis
     // front of it. This is what makes dw delete "foo " while de hits the last
     // character of the line deletes it too.
     const bool inclusive = motion.ch == L'$' || motion.ch == L'e' || motion.ch == L'f'
-                        || motion.ch == L'F';
+                        || motion.ch == L'F' || motion.ch == L'%';
     const bool forwardMotion = motion.ch == L'l' || motion.ch == L'w' || motion.ch == L'e'
-                            || motion.ch == L'$' || motion.ch == L'f' || motion.ch == L't';
+                            || motion.ch == L'$' || motion.ch == L'f' || motion.ch == L't'
+                            || motion.ch == L' ' || motion.ch == L'%';
     start = std::min(from, to);
     end = std::max(from, to) + (inclusive ? 1 : 0);
     // An exclusive motion that cannot advance still covers the character under
@@ -805,16 +1300,16 @@ void VimEditor::handlePending(const Key& k)
         m_cursor.line = hasCount
             ? std::min<std::size_t>(static_cast<std::size_t>(count) - 1, lineCount() - 1)
             : 0;
-        m_cursor.col = 0;
-        m_desiredCol = 0;
+        m_cursor.col = firstNonBlankCol(m_cursor.line);
+        m_desiredCol = m_cursor.col;
         syncCursorAndSelection();
         return;
     }
 
-    if (k.name != KeyName::Char)
+    if (k.name != KeyName::Char && k.name != KeyName::Enter)
         return;
 
-    const wchar_t arg = k.ch;
+    const wchar_t arg = k.name == KeyName::Enter ? L'\n' : k.ch;
     m_pending = Pending::None;
 
     if (pending == Pending::Replace)
@@ -822,10 +1317,24 @@ void VimEditor::handlePending(const Key& k)
         const int count = m_countActive ? m_count : 1;
         m_count = 1;
         m_countActive = false;
+        const std::size_t lineLen = lineLength(m_cursor.line);
+        if (lineLen == 0 || m_cursor.col + static_cast<std::size_t>(count) > lineLen)
+            return; // vim fails a replace that runs off the line: no change
         beginEdit();
-        std::size_t at = offset(m_cursor.line, m_cursor.col);
-        for (int i = 0; i < count && at < m_text.size() && !isLineBreak(m_text[at]); ++i, ++at)
-            m_text[at] = arg;
+        const std::size_t at = offset(m_cursor.line, m_cursor.col);
+        if (arg == L'\n')
+        {
+            m_text.replace(at, 1, L"\n"); // r<CR> breaks the line
+            m_cursor.line += 1;
+            m_cursor.col = 0;
+        }
+        else
+        {
+            for (int i = 0; i < count; ++i)
+                m_text[at + static_cast<std::size_t>(i)] = arg;
+            m_cursor.col += static_cast<std::size_t>(count) - 1; // land on the last one
+        }
+        m_desiredCol = m_cursor.col;
         endEdit();
         syncCursorAndSelection();
         return;
@@ -927,13 +1436,51 @@ void VimEditor::handleNormal(const Key& k)
         m_countActive = false;
     };
 
-    // 2. Operator pending: this key is its motion (or a doubled operator).
+    // 2. Ctrl chords the core owns: numeric edit, paging, redo. Others are the
+    //    host's (Ctrl+S/Z/Y...) and are ignored here.
+    if (k.name == KeyName::Char && k.ctrl)
+    {
+        m_operator = L'\0';
+        m_object = Object::None;
+        switch (k.ch)
+        {
+        case L'a': resetCount(); adjustNumber(1, count); return;
+        case L'x': resetCount(); adjustNumber(-1, count); return;
+        case L'R':
+            resetCount();
+            for (int i = 0; i < count; ++i)
+                doRedo();
+            return;
+        case L'd': case L'u': case L'f': case L'b':
+        {
+            resetCount();
+            const Cursor target = motionApply(m_cursor, k, count, hasCount);
+            if (target.line != m_cursor.line || target.col != m_cursor.col)
+            {
+                m_cursor = target; // vertical: desired column is preserved
+                syncCursorAndSelection();
+            }
+            return;
+        }
+        default:
+            resetCount();
+            return;
+        }
+    }
+
+    // 3. Operator pending: this key is its motion (or a doubled operator).
     if (m_operator != L'\0')
     {
         if (k.name == KeyName::Esc)
         {
             m_operator = L'\0';
             resetCount();
+            return;
+        }
+        if (k.name == KeyName::Char && (k.ch == L'i' || k.ch == L'a'))
+        {
+            // iw/aw: wait for the object character.
+            m_object = k.ch == L'i' ? Object::InnerWord : Object::AWord;
             return;
         }
         if (k.name == KeyName::Char && k.ch == m_operator)
@@ -974,13 +1521,13 @@ void VimEditor::handleNormal(const Key& k)
         return;
     }
 
-    // 3. Plain commands; the count resets once one has run.
+    // 4. Plain commands; the count resets once one has run.
     if (k.name == KeyName::Char)
     {
         switch (k.ch)
         {
-        case L'i': resetCount(); enterInsert(false); return;
-        case L'a': resetCount(); enterInsert(true); return;
+        case L'i': resetCount(); enterInsert(false, false, false, count); return;
+        case L'a': resetCount(); enterInsert(true, false, false, count); return;
         case L'I':
             resetCount();
             m_cursor.col = 0;
@@ -991,15 +1538,75 @@ void VimEditor::handleNormal(const Key& k)
                     ++i;
                 m_cursor.col = i < line.size() ? i : 0;
             }
-            enterInsert(false);
+            enterInsert(false, false, false, count);
             return;
         case L'A':
             resetCount();
             m_cursor.col = lineLength(m_cursor.line);
-            enterInsert(false);
+            enterInsert(false, false, false, count);
             return;
-        case L'o': resetCount(); enterInsert(false, true, false); return;
-        case L'O': resetCount(); enterInsert(false, false, true); return;
+        case L'o': resetCount(); enterInsert(false, true, false, count); return;
+        case L'O': resetCount(); enterInsert(false, false, true, count); return;
+        case L'R':
+            resetCount();
+            enterReplace(count);
+            return;
+        case L'.':
+        {
+            resetCount();
+            if (m_lastChange.empty())
+                return;
+            m_suppressRecord = true; // the replay is not a new "last change"
+            m_replaying = true;
+            for (int i = 0; i < count; ++i)
+            {
+                for (const Key& rk : m_lastChange)
+                    key(rk);
+            }
+            m_replaying = false;
+            m_replayBuffer.clear();
+            return;
+        }
+        case L'%':
+        {
+            resetCount();
+            const std::optional<std::size_t> match =
+                bracketMatchCol(m_cursor.line, m_cursor.col);
+            if (match)
+            {
+                m_cursor.col = *match;
+                m_desiredCol = m_cursor.col;
+                syncCursorAndSelection();
+            }
+            return;
+        }
+        case L'~':
+        {
+            resetCount();
+            const std::size_t lineLen = lineLength(m_cursor.line);
+            if (lineLen == 0)
+                return;
+            const std::size_t at = offset(m_cursor.line, m_cursor.col);
+            const std::size_t n = std::min<std::size_t>(static_cast<std::size_t>(count),
+                                                        lineLen - m_cursor.col);
+            applyCase(at, at + n, 2);
+            m_cursor.col = std::min(m_cursor.col + n, lastCharCol(m_cursor.line));
+            m_desiredCol = m_cursor.col;
+            syncCursorAndSelection();
+            return;
+        }
+        case L'Y':
+        {
+            resetCount();
+            const std::size_t fromLine = m_cursor.line;
+            const std::size_t toLine =
+                std::min(fromLine + static_cast<std::size_t>(count) - 1, lineCount() - 1);
+            const std::size_t start = lineStart(fromLine);
+            const std::size_t end =
+                lineStart(toLine) + lineLength(toLine) + (toLine + 1 < lineCount() ? 1 : 0);
+            operatorYank(start, end, true);
+            return;
+        }
         case L'v':
             resetCount();
             m_mode = Mode::Visual;
@@ -1093,7 +1700,8 @@ void VimEditor::handleNormal(const Key& k)
             return;
         case L'u':
             resetCount();
-            doUndo();
+            for (int i = 0; i < count; ++i)
+                doUndo();
             return;
         case L';':
             resetCount();
@@ -1126,18 +1734,12 @@ void VimEditor::handleNormal(const Key& k)
         return;
     }
 
-    if (k.name == KeyName::Char && k.ch == L'R' && k.ctrl)
-    {
-        resetCount();
-        doRedo();
-        return;
-    }
-
-    // 4. Motions (h j k l w b e 0 ^ $ G, arrows, Home/End, Enter, Backspace).
+    // 5. Motions (h j k l w b e 0 ^ $ G %, space, arrows, Home/End, Enter,
+    //    Backspace).
     if (k.name == KeyName::Backspace)
     {
         resetCount();
-        const Cursor target = motionApply(m_cursor, makeChar(L'h'), 1, false);
+        const Cursor target = motionApply(m_cursor, k, count, hasCount);
         m_cursor = target;
         m_desiredCol = m_cursor.col;
         syncCursorAndSelection();
@@ -1146,7 +1748,7 @@ void VimEditor::handleNormal(const Key& k)
     if (k.name == KeyName::Delete)
     {
         resetCount();
-        removeCharsAtCursor(static_cast<std::size_t>(count), false);
+        removeCharsAtCursor(static_cast<std::size_t>(count), true); // <Del> == x
         return;
     }
     if (k.name == KeyName::Enter)
@@ -1185,6 +1787,33 @@ void VimEditor::handleNormal(const Key& k)
 
 // ---- Insert mode ----------------------------------------------------------------
 
+void VimEditor::handleInsertMotion(const Key& k)
+{
+    switch (k.name)
+    {
+    case KeyName::Left:
+        if (m_cursor.col > 0) --m_cursor.col;
+        else if (m_cursor.line > 0) { --m_cursor.line; m_cursor.col = lineLength(m_cursor.line); }
+        break;
+    case KeyName::Right:
+        if (m_cursor.col < lineLength(m_cursor.line)) ++m_cursor.col;
+        else if (m_cursor.line + 1 < lineCount()) { ++m_cursor.line; m_cursor.col = 0; }
+        break;
+    case KeyName::Up:
+        if (m_cursor.line > 0) --m_cursor.line;
+        m_cursor.col = std::min(m_cursor.col, lineLength(m_cursor.line));
+        break;
+    case KeyName::Down:
+        if (m_cursor.line + 1 < lineCount()) ++m_cursor.line;
+        m_cursor.col = std::min(m_cursor.col, lineLength(m_cursor.line));
+        break;
+    case KeyName::Home: m_cursor.col = 0; break;
+    default: m_cursor.col = lineLength(m_cursor.line); break;
+    }
+    m_desiredCol = m_cursor.col;
+    syncCursorAndSelection();
+}
+
 void VimEditor::handleInsert(const Key& k)
 {
     switch (k.name)
@@ -1194,32 +1823,8 @@ void VimEditor::handleInsert(const Key& k)
         return;
     case KeyName::Left: case KeyName::Right: case KeyName::Up: case KeyName::Down:
     case KeyName::Home: case KeyName::End:
-    {
-        switch (k.name)
-        {
-        case KeyName::Left:
-            if (m_cursor.col > 0) --m_cursor.col;
-            else if (m_cursor.line > 0) { --m_cursor.line; m_cursor.col = lineLength(m_cursor.line); }
-            break;
-        case KeyName::Right:
-            if (m_cursor.col < lineLength(m_cursor.line)) ++m_cursor.col;
-            else if (m_cursor.line + 1 < lineCount()) { ++m_cursor.line; m_cursor.col = 0; }
-            break;
-        case KeyName::Up:
-            if (m_cursor.line > 0) --m_cursor.line;
-            m_cursor.col = std::min(m_cursor.col, lineLength(m_cursor.line));
-            break;
-        case KeyName::Down:
-            if (m_cursor.line + 1 < lineCount()) ++m_cursor.line;
-            m_cursor.col = std::min(m_cursor.col, lineLength(m_cursor.line));
-            break;
-        case KeyName::Home: m_cursor.col = 0; break;
-        default: m_cursor.col = lineLength(m_cursor.line); break;
-        }
-        m_desiredCol = m_cursor.col;
-        syncCursorAndSelection();
+        handleInsertMotion(k);
         return;
-    }
     case KeyName::Backspace:
     {
         if (m_cursor.col == 0 && m_cursor.line == 0)
@@ -1236,6 +1841,8 @@ void VimEditor::handleInsert(const Key& k)
             --m_cursor.line;
             m_cursor.col = lineLength(m_cursor.line);
         }
+        if (!m_sessionTyped.empty())
+            m_sessionTyped.pop_back();
         m_desiredCol = m_cursor.col;
         flushEdit();
         syncCursorAndSelection();
@@ -1259,6 +1866,7 @@ void VimEditor::handleInsert(const Key& k)
         m_text.insert(offset(m_cursor.line, m_cursor.col), L"\n");
         ++m_cursor.line;
         m_cursor.col = 0;
+        m_sessionTyped += L'\n';
         m_desiredCol = 0;
         flushEdit();
         syncCursorAndSelection();
@@ -1269,6 +1877,7 @@ void VimEditor::handleInsert(const Key& k)
         beginEdit();
         m_text.insert(offset(m_cursor.line, m_cursor.col), L"    ");
         m_cursor.col += 4;
+        m_sessionTyped += L"    ";
         m_desiredCol = m_cursor.col;
         flushEdit();
         syncCursorAndSelection();
@@ -1281,6 +1890,7 @@ void VimEditor::handleInsert(const Key& k)
         beginEdit();
         m_text.insert(offset(m_cursor.line, m_cursor.col), 1, k.ch);
         ++m_cursor.col;
+        m_sessionTyped += k.ch;
         m_desiredCol = m_cursor.col;
         flushEdit();
         syncCursorAndSelection();
@@ -1339,15 +1949,53 @@ void VimEditor::handleVisual(const Key& k)
         {
         case L'v':
             resetCount();
+            // Switching v<->V keeps the anchor, so the same range stays visible.
             m_mode = m_mode == Mode::Visual ? Mode::Normal : Mode::Visual;
-            m_visualAnchor = m_cursor;
             syncCursorAndSelection();
             return;
         case L'V':
             resetCount();
             m_mode = m_mode == Mode::VisualLine ? Mode::Normal : Mode::VisualLine;
-            m_visualAnchor = m_cursor;
             syncCursorAndSelection();
+            return;
+        case L'o':
+            resetCount();
+            std::swap(m_visualAnchor, m_cursor); // extend from the other end
+            m_desiredCol = m_cursor.col;
+            syncCursorAndSelection();
+            return;
+        case L'i': case L'a':
+            resetCount();
+            m_object = k.ch == L'i' ? Object::InnerWord : Object::AWord;
+            return;
+        case L'%':
+        {
+            resetCount();
+            const std::optional<std::size_t> match =
+                bracketMatchCol(m_cursor.line, m_cursor.col);
+            if (match)
+            {
+                m_cursor.col = *match;
+                m_desiredCol = m_cursor.col;
+                syncCursorAndSelection();
+            }
+            return;
+        }
+        case L'u': case L'U': case L'~':
+            resetCount();
+            applyCase(start, end, k.ch == L'u' ? 0 : k.ch == L'U' ? 1 : 2);
+            m_mode = Mode::Normal;
+            m_cursor = cursorFor(start);
+            m_desiredCol = m_cursor.col;
+            syncCursorAndSelection();
+            return;
+        case L'p':
+            resetCount();
+            visualPaste();
+            return;
+        case L'J':
+            resetCount();
+            visualJoin();
             return;
         case L'd': case L'x':
             resetCount();
@@ -1388,15 +2036,97 @@ void VimEditor::handleVisual(const Key& k)
 
 void VimEditor::key(const Key& k)
 {
+    if (m_replaying)
+    {
+        dispatch(k);
+        return;
+    }
+
+    m_batchClosed = false;
+    m_replayBuffer.push_back(k);
+    const std::wstring textBefore = m_text;
+    const Mode modeBefore = m_mode;
+    dispatch(k);
+
+    if (m_batchClosed && !m_suppressRecord)
+    {
+        // A visual-range change has no meaningful Normal-mode replay in this
+        // core (the range would have to be remembered); keep '.' harmless.
+        if (modeBefore == Mode::Visual || modeBefore == Mode::VisualLine)
+            m_replayBuffer.clear();
+        else
+            commitReplay();
+    }
+    else if (!m_editing && !m_batchClosed && m_text == textBefore
+             && m_operator == L'\0' && m_pending == Pending::None
+             && !m_countActive && m_object == Object::None
+             && m_mode != Mode::Insert && m_mode != Mode::Replace)
+    {
+        m_replayBuffer.clear(); // a motion or a cancel: nothing to repeat
+    }
+    m_suppressRecord = false;
+}
+
+void VimEditor::dispatch(const Key& k)
+{
     if (m_pending != Pending::None)
     {
         handlePending(k);
+        return;
+    }
+    if (m_object != Object::None)
+    {
+        if (k.name == KeyName::Esc)
+        {
+            m_object = Object::None;
+            m_operator = L'\0';
+            m_count = 1;
+            m_countActive = false;
+            return;
+        }
+        if (k.name == KeyName::Char && k.ch == L'w')
+        {
+            std::size_t start = 0;
+            std::size_t end = 0;
+            if (m_mode == Mode::Visual || m_mode == Mode::VisualLine)
+            {
+                // viw / vaw: select the word under the cursor.
+                if (wordRange(start, end, m_object == Object::AWord))
+                {
+                    m_visualAnchor = cursorFor(start);
+                    m_cursor = cursorFor(end > start ? end - 1 : start);
+                    m_desiredCol = m_cursor.col;
+                }
+                m_object = Object::None;
+                syncCursorAndSelection();
+                return;
+            }
+            if (wordRange(start, end, m_object == Object::AWord))
+            {
+                if (m_operator == L'd')
+                    operatorDelete(start, end, false);
+                else if (m_operator == L'c')
+                    operatorChange(start, end, false);
+                else if (m_operator == L'y')
+                    operatorYank(start, end, false);
+            }
+            m_object = Object::None;
+            m_operator = L'\0';
+            m_count = 1;
+            m_countActive = false;
+            return;
+        }
+        // Not the object char: cancel the object and treat the key normally
+        // (dj after a stray "di" still deletes two lines, as vim does).
+        m_object = Object::None;
+        dispatch(k);
         return;
     }
     switch (m_mode)
     {
     case Mode::Normal: handleNormal(k); break;
     case Mode::Insert: handleInsert(k); break;
+    case Mode::Replace: handleReplace(k); break;
     case Mode::Visual:
     case Mode::VisualLine: handleVisual(k); break;
     }
