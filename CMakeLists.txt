@@ -20,8 +20,10 @@ else()
     target_compile_options(vimcore PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-include(CTest)
-if(BUILD_TESTING)
+option(VIMCORE_BUILD_TESTS "Build the vimcore behaviour tests" ON)
+
+if(VIMCORE_BUILD_TESTS)
+    enable_testing()
     add_executable(vimcore_tests
         tests/test_vimcore.cpp
     )
