@@ -827,6 +827,113 @@ TEST_CASE(TildeTogglesAndAdvances)
     CHECK_EQ(e.doc.m_cursor.col, std::size_t{1}); // advanced, no wrap
 }
 
+// ---- operators + find motions, and visual/block replace -------------------------
+// Every expectation below was checked against nvim (--headless, normal!), so the
+// core follows vim rather than its own earlier behaviour.
+
+TEST_CASE(OperatorTakesFindAndTillMotions)
+{
+    // Forward motions include the character they land on.
+    { Env e(L"foo,bar"); e.editor.keys(seq(vc::chars(L"df,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"bar")); }
+    { Env e(L"foo,bar"); e.editor.keys(seq(vc::chars(L"dt,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L",bar")); }
+    // Backward motions stop before the character under the cursor.
+    { Env e(L"foo,bar", {0, 5}); e.editor.keys(seq(vc::chars(L"dF,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"fooar")); }
+    { Env e(L"foo,bar", {0, 5}); e.editor.keys(seq(vc::chars(L"dT,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"foo,ar")); }
+    // A count on the motion picks the count'th match.
+    { Env e(L"a,b,c"); e.editor.keys(seq(vc::chars(L"d2f,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"c")); }
+    // y and c ride the same range; c leaves Insert on it.
+    { Env e(L"foo,bar"); e.editor.keys(seq(vc::chars(L"yt,")));
+      CHECK_EQ(e.editor.registerText(), std::wstring(L"foo")); }
+    { Env e(L"foo,bar"); e.editor.keys(seq(vc::chars(L"ct,X")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"X,bar")); }
+    // A till motion with no gap does not move: the operator is cancelled.
+    { Env e(L"foo,bar", {0, 4}); e.editor.keys(seq(vc::chars(L"dT,")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"foo,bar")); }
+    // No match on the line cancels the operator as well.
+    { Env e(L"foo,bar"); e.editor.keys(seq(vc::chars(L"dfz")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"foo,bar")); }
+    // t keeps its own argument, so "dt;" looks for a literal ';'.
+    { Env e(L"a-b-c"); e.editor.keys(seq(vc::chars(L"dt;")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"a-b-c")); }
+}
+
+TEST_CASE(OperatorRepeatsTheLastFind)
+{
+    // f- lands on the '-'; d; repeats the find and deletes up to the next one.
+    { Env e(L"a-b-c"); e.editor.keys(seq(vc::chars(L"f-")));
+      CHECK_EQ(e.doc.m_cursor.col, std::size_t{1});
+      e.editor.keys(seq(vc::chars(L"d;")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"ac")); }
+    { Env e(L"a-b-c"); e.editor.keys(seq(vc::chars(L"f-c;X")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"aXc")); }
+    // The count repeats the search twice.
+    { Env e(L"a-b-c-d"); e.editor.keys(seq(vc::chars(L"f-d2;")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"ad")); }
+    // No remembered find: the operator is abandoned, nothing changes.
+    { Env e(L"a-b-c"); e.editor.keys(seq(vc::chars(L"d;")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"a-b-c")); }
+}
+
+TEST_CASE(VisualReplaceMatchesVim)
+{
+    { Env e(L"abcdef"); e.editor.keys(seq(vc::chars(L"vllrX")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"XXXdef"));
+      CHECK(e.editor.mode() == vc::Mode::Normal); }
+    // Line-wise: every character of the lines, the newline itself untouched.
+    { Env e(L"abc\ndef"); e.editor.keys(seq(vc::chars(L"VjrX")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"XXX\nXXX")); }
+    // Esc before the replacement character leaves the text alone.
+    { Env e(L"abcdef"); e.editor.keys(seq(vc::chars(L"vllr"), esc()));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"abcdef"));
+      CHECK(e.editor.mode() == vc::Mode::Normal); }
+    // One undo step for the whole range.
+    { Env e(L"abcdef"); e.editor.keys(seq(vc::chars(L"vllrX")));
+      e.editor.keys(seq(vc::chars(L"u")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"abcdef")); }
+}
+
+TEST_CASE(BlockReplaceOnlyCoversExistingCharacters)
+{
+    // Block over "abcd / x / efgh", columns 0-1: the one-character row stays one
+    // character long (vim does not pad it with spaces).
+    { Env e(L"abcd\nx\nefgh");
+      e.editor.keys(seq(ctrl(L'q'), vc::chars(L"jjlrX")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"XXcd\nX\nXXgh"));
+      CHECK(e.editor.mode() == vc::Mode::Normal); }
+    // Columns 2-2 only: a row shorter than the block is untouched.
+    { Env e(L"abcd\nx\nefgh");
+      e.editor.keys(seq(vc::chars(L"ll"), ctrl(L'q'), vc::chars(L"jjrX")));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"abXd\nx\nefXh")); }
+    { Env e(L"abcd\nx\nefgh");
+      CHECK_EQ(e.editor.mode(), vc::Mode::Normal);
+      e.editor.keys(seq(ctrl(L'q'), vc::chars(L"jlr"), esc()));
+      CHECK_EQ(e.doc.m_text, std::wstring(L"abcd\nx\nefgh")); }
+}
+
+TEST_CASE(QuitRequestsAreReportedOnce)
+{
+    Env e(L"abc");
+    e.editor.keys(seq(vc::chars(L":q"), enter()));
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::Plain);
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::None); // taken once
+    e.editor.keys(seq(vc::chars(L":q!"), enter()));
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::Force);
+    e.editor.keys(seq(vc::chars(L":quit"), enter()));
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::Plain);
+    e.editor.keys(seq(vc::chars(L":quit!"), enter()));
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::Force);
+    CHECK_EQ(e.doc.m_text, std::wstring(L"abc")); // :q never edits text
+    // Anything else still runs the normal command path.
+    e.editor.keys(seq(vc::chars(L":%s/b/X/"), enter()));
+    CHECK_EQ(e.doc.m_text, std::wstring(L"aXc"));
+    CHECK(e.editor.takeQuitRequest() == vc::QuitRequest::None);
+}
+
 int main()
 {
     return vim_test::runAll();

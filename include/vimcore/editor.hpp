@@ -6,7 +6,7 @@
 // find (f/F/t/T), pending replace (r), counts, yank register, undo/redo,
 // dot-repeat recording, and Replace mode.
 //
-// Not implemented on purpose (README documents this): ex commands, named
+// Not implemented on purpose (README documents this): named
 // registers, macros, marks, search, the g prefix beyond gg, multiple buffers.
 #pragma once
 
@@ -19,7 +19,12 @@
 
 namespace vimcore {
 
-enum class Mode { Normal, Insert, Replace, Visual, VisualLine };
+enum class Mode { Normal, Insert, Replace, Visual, VisualLine, VisualBlock };
+
+// ":q" / ":q!" as the core sees them. The core owns no windows, so it only
+// reports the request; the host decides what closing means (for the rename
+// plugin it closes the plugin window).
+enum class QuitRequest { None, Plain, Force };
 
 struct EditorOptions {
     std::size_t undoDepth = 1000;
@@ -46,6 +51,11 @@ public:
     void refreshFromDocument();
 
     Mode mode() const { return m_mode; }
+    bool commandMode() const { return m_commandMode; }
+
+    // ":q" / ":q!" typed in the command line, handed to the host. Reading it
+    // clears it, so one request is acted on exactly once.
+    QuitRequest takeQuitRequest();
     // The yank register contents; exposed for tests and hosts that want a
     // system-clipboard bridge.
     const std::wstring& registerText() const { return m_register; }
@@ -69,6 +79,8 @@ private:
     void handleInsert(const Key& k);
     void handleReplace(const Key& k);
     void handleVisual(const Key& k);
+    void handleBlock(const Key& k);
+    void executeCommand();
     void handlePending(const Key& k);      // f/F/t/T/r/gg waiting for their char
     void handleInsertMotion(const Key& k); // arrow/Home/End caret moves while editing
     void dispatch(const Key& k);           // key() minus the '.'-recording wrapper
@@ -130,13 +142,24 @@ private:
     Cursor m_savedCursor;                  // cursor the open batch started from
     bool m_editing = false;                // a batch is open
 
-    enum class Pending { None, Find, FindBack, Till, TillBack, Replace, GG };
+    enum class Pending { None, Find, FindBack, Till, TillBack, Replace, GG, VisualReplace };
     Pending m_pending = Pending::None;
 
     enum class Object { None, InnerWord, AWord };
     Object m_object = Object::None;        // iw/aw chosen, waiting for the object char
 
     Cursor m_visualAnchor;                 // where v/V was pressed
+    bool m_blockInsert = false;
+    bool m_commandMode = false;
+    bool m_runningCommand = false;
+    std::wstring m_command;
+    std::size_t m_commandFirst = 0;
+    std::size_t m_commandLast = 0;
+    bool m_blockAppend = false;
+    std::size_t m_blockFirst = 0;
+    std::size_t m_blockLast = 0;
+    std::size_t m_blockColumn = 0;
+    std::wstring m_blockOriginalLine;
 
     wchar_t m_operator = L'\0';            // 'd'/'c'/'y' waiting for a motion
     int m_operatorCount = 1;               // count typed before the operator
@@ -146,6 +169,9 @@ private:
 
     std::optional<wchar_t> m_lastFindChar; // ; / , repeat
     bool m_lastFindForward = false;
+    bool m_lastFindTill = false;           // the repeat was t/T, not f/F
+
+    QuitRequest m_quitRequest = QuitRequest::None;
 
     std::wstring m_register;
     bool m_lastYankLineWise = false;

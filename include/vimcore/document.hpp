@@ -31,6 +31,7 @@ struct Selection {
     Cursor head;
     bool active = false;
     bool lineWise = false;  // V mode: whole lines
+    bool blockWise = false;
 };
 
 class Document {

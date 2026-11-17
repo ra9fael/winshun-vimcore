@@ -8,6 +8,7 @@
 //   3. Undo snapshots are taken when a *batch* opens, so a whole insert session
 //      is one undo even though each typed character reaches the host.
 #include "vimcore/editor.hpp"
+#include <regex>
 
 #include <algorithm>
 #include <cwchar>
@@ -140,10 +141,11 @@ void VimEditor::syncCursorAndSelection()
 {
     m_doc.setCursor(m_cursor);
     Selection selection;
-    if (m_mode == Mode::Visual || m_mode == Mode::VisualLine)
+    if (m_mode == Mode::Visual || m_mode == Mode::VisualLine || m_mode == Mode::VisualBlock)
     {
         selection.active = true;
         selection.lineWise = m_mode == Mode::VisualLine;
+        selection.blockWise = m_mode == Mode::VisualBlock;
         selection.anchor = m_visualAnchor;
         selection.head = m_cursor;
     }
@@ -155,6 +157,7 @@ void VimEditor::syncCursorAndSelection()
     case Mode::Replace:    m_doc.setStatus(L"-- REPLACE --"); break;
     case Mode::Visual:     m_doc.setStatus(L"-- VISUAL --"); break;
     case Mode::VisualLine: m_doc.setStatus(L"-- VISUAL LINE --"); break;
+    case Mode::VisualBlock: m_doc.setStatus(L"-- VISUAL BLOCK --"); break;
     }
 }
 
@@ -260,6 +263,30 @@ void VimEditor::enterInsert(bool afterCursor, bool openLineBelow, bool openLineA
 
 void VimEditor::exitInsert()
 {
+    if (m_blockInsert)
+    {
+        const auto current = lineText(m_blockFirst);
+        const auto prefix = m_blockOriginalLine.substr(0, m_blockColumn);
+        const auto suffix = m_blockOriginalLine.substr(m_blockColumn);
+        const bool insertionOnly = current.size() >= m_blockOriginalLine.size()
+            && current.starts_with(prefix) && current.ends_with(suffix);
+        const auto inserted = insertionOnly
+            ? current.substr(m_blockColumn, current.size() - m_blockOriginalLine.size()) : std::wstring();
+        if (!inserted.empty() && lineCount() == static_cast<std::size_t>(std::count(m_undo.back().text.begin(), m_undo.back().text.end(), L'\n')) + 1)
+        {
+            for (std::size_t line = m_blockLast; line > m_blockFirst; --line)
+            {
+                const auto length = lineLength(line);
+                if (length < m_blockColumn && !m_blockAppend)
+                    continue;
+                if (length < m_blockColumn)
+                    m_text.insert(lineStart(line) + length, m_blockColumn - length, L' ');
+                m_text.insert(lineStart(line) + m_blockColumn, inserted);
+            }
+        }
+        m_blockInsert = false;
+        flushEdit();
+    }
     // {count}i repeats the typed text count times; {count}o opens count lines.
     // Both happen before the batch closes so the whole thing stays one undo.
     const std::wstring typed = m_sessionTyped;
@@ -1285,6 +1312,14 @@ void VimEditor::handlePending(const Key& k)
         m_operator = L'\0';
         m_count = 1;
         m_countActive = false;
+        if (pending == Pending::VisualReplace)
+        {
+            // "vllr<Esc>" abandons the replace and leaves Visual mode, leaving
+            // the text untouched (vim does the same).
+            m_mode = Mode::Normal;
+            clampCursor();
+            syncCursorAndSelection();
+        }
         return;
     }
 
@@ -1340,6 +1375,63 @@ void VimEditor::handlePending(const Key& k)
         return;
     }
 
+    if (pending == Pending::VisualReplace)
+    {
+        m_count = 1;
+        m_countActive = false;
+        const auto finish = [this] {
+            m_mode = Mode::Normal;
+            clampCursor();
+            syncCursorAndSelection();
+        };
+        if (arg == L'\n')
+        {
+            finish(); // r<CR> is not a usable replacement for a visual range
+            return;
+        }
+        if (m_mode == Mode::VisualBlock)
+        {
+            const auto first = std::min(m_visualAnchor.line, m_cursor.line);
+            const auto last = std::max(m_visualAnchor.line, m_cursor.line);
+            const auto left = std::min(m_visualAnchor.col, m_cursor.col);
+            const auto right = std::max(m_visualAnchor.col, m_cursor.col);
+            beginEdit();
+            for (auto line = first; line <= last; ++line)
+            {
+                // Only characters that are actually there: a short row is left
+                // short instead of being space-padded, exactly like vim.
+                const std::size_t stop = std::min(right + 1, lineLength(line));
+                for (std::size_t col = left; col < stop; ++col)
+                    m_text[lineStart(line) + col] = arg;
+            }
+            m_cursor = {first, left};
+            endEdit();
+            finish();
+            return;
+        }
+        // Character- and line-wise: every character of the range is replaced.
+        const std::size_t anchor = offset(m_visualAnchor.line, m_visualAnchor.col);
+        const std::size_t head = offset(m_cursor.line, m_cursor.col);
+        std::size_t start = std::min(anchor, head);
+        std::size_t end = std::max(anchor, head) + 1;
+        if (m_mode == Mode::VisualLine)
+        {
+            const std::size_t fromLine = cursorFor(start).line;
+            const std::size_t toLine = cursorFor(std::max(anchor, head)).line;
+            start = lineStart(fromLine);
+            end = lineStart(toLine) + lineLength(toLine) + (toLine + 1 < lineCount() ? 1 : 0);
+        }
+        beginEdit();
+        for (std::size_t i = start; i < end && i < m_text.size(); ++i)
+            if (m_text[i] != L'\n')
+                m_text[i] = arg;
+        m_cursor = cursorFor(start);
+        m_desiredCol = m_cursor.col;
+        endEdit();
+        finish();
+        return;
+    }
+
     const bool forward = pending == Pending::Find || pending == Pending::Till;
     const bool till = pending == Pending::Till || pending == Pending::TillBack;
     const bool operatorPending = m_operator != L'\0';
@@ -1388,6 +1480,7 @@ void VimEditor::handlePending(const Key& k)
     }
     m_lastFindChar = arg;
     m_lastFindForward = forward;
+    m_lastFindTill = till;
 
     std::size_t targetCol = *found;
     if (till)
@@ -1397,8 +1490,27 @@ void VimEditor::handlePending(const Key& k)
     {
         const std::size_t from = offset(m_cursor.line, m_cursor.col);
         const std::size_t to = lineBegin + targetCol;
-        std::size_t start = std::min(from, to);
-        std::size_t end = std::max(from, to) + (till ? 0 : 1);
+        // Operator + find follows vim's own rules, verified against nvim:
+        // a forward motion includes the character it lands on, a backward one
+        // stops before the cursor character, and a motion that does not move
+        // (dT, with the target right next to the cursor) cancels.
+        std::size_t start = 0;
+        std::size_t end = 0;
+        if (to > from)
+        {
+            start = from;
+            end = to + 1;
+        }
+        else if (to < from)
+        {
+            start = to;
+            end = from;
+        }
+        else
+        {
+            m_operator = L'\0';
+            return;
+        }
         end = std::min(end, lineBegin + lineLen);
         if (m_operator == L'd')
             operatorDelete(start, end, false);
@@ -1481,6 +1593,31 @@ void VimEditor::handleNormal(const Key& k)
         {
             // iw/aw: wait for the object character.
             m_object = k.ch == L'i' ? Object::InnerWord : Object::AWord;
+            return;
+        }
+        // Operator + find (df, dt] dF, dT, d; d,) — the character to search for
+        // arrives on the next key, so hand it to the pending handler with the
+        // operator and count still in place.
+        if (k.name == KeyName::Char && !k.ctrl
+            && (k.ch == L'f' || k.ch == L'F' || k.ch == L't' || k.ch == L'T'))
+        {
+            m_pending = k.ch == L'f' ? Pending::Find : k.ch == L'F' ? Pending::FindBack
+                      : k.ch == L't' ? Pending::Till : Pending::TillBack;
+            return;
+        }
+        if (k.name == KeyName::Char && !k.ctrl && (k.ch == L';' || k.ch == L','))
+        {
+            if (!m_lastFindChar)
+            {
+                m_operator = L'\0';
+                resetCount();
+                return;
+            }
+            const bool sameDirection = k.ch == L';';
+            const bool back = sameDirection ? !m_lastFindForward : m_lastFindForward;
+            m_pending = m_lastFindTill ? (back ? Pending::TillBack : Pending::Till)
+                                       : (back ? Pending::FindBack : Pending::Find);
+            handlePending(makeChar(*m_lastFindChar));
             return;
         }
         if (k.name == KeyName::Char && k.ch == m_operator)
@@ -1707,7 +1844,9 @@ void VimEditor::handleNormal(const Key& k)
             resetCount();
             if (m_lastFindChar)
             {
-                m_pending = m_lastFindForward ? Pending::Find : Pending::FindBack;
+                m_pending = m_lastFindTill
+                    ? (m_lastFindForward ? Pending::Till : Pending::TillBack)
+                    : (m_lastFindForward ? Pending::Find : Pending::FindBack);
                 m_count = count;
                 m_countActive = hasCount;
                 handlePending(makeChar(*m_lastFindChar));
@@ -1717,7 +1856,9 @@ void VimEditor::handleNormal(const Key& k)
             resetCount();
             if (m_lastFindChar)
             {
-                m_pending = m_lastFindForward ? Pending::FindBack : Pending::Find;
+                m_pending = m_lastFindTill
+                    ? (m_lastFindForward ? Pending::TillBack : Pending::Till)
+                    : (m_lastFindForward ? Pending::FindBack : Pending::Find);
                 m_count = count;
                 m_countActive = hasCount;
                 handlePending(makeChar(*m_lastFindChar));
@@ -1903,6 +2044,77 @@ void VimEditor::handleInsert(const Key& k)
 
 // ---- Visual mode ----------------------------------------------------------------
 
+void VimEditor::handleBlock(const Key& k)
+{
+    const auto first = std::min(m_visualAnchor.line, m_cursor.line);
+    const auto last = std::max(m_visualAnchor.line, m_cursor.line);
+    const auto left = std::min(m_visualAnchor.col, m_cursor.col);
+    const auto right = std::max(m_visualAnchor.col, m_cursor.col);
+    if (k.name == KeyName::Char && !k.ctrl && (k.ch == L'I' || k.ch == L'A'))
+    {
+        m_blockFirst = first;
+        m_blockLast = last;
+        m_blockColumn = k.ch == L'I' ? left : right + 1;
+        m_blockAppend = k.ch == L'A';
+        beginEdit();
+        m_cursor = {first, m_blockColumn};
+        if (lineLength(first) < m_blockColumn)
+            m_text.insert(lineStart(first) + lineLength(first), m_blockColumn - lineLength(first), L' ');
+        m_blockOriginalLine = lineText(first);
+        enterInsert(false);
+        m_blockInsert = true;
+        return;
+    }
+    if (k.name == KeyName::Char && !k.ctrl && k.ch == L'r')
+    {
+        // Block-wise r: replace every character inside the rectangle. Nothing is
+        // applied yet; the replacement character is the next key.
+        m_pending = Pending::VisualReplace;
+        return;
+    }
+    if (k.name == KeyName::Char && !k.ctrl && (k.ch == L'd' || k.ch == L'x' || k.ch == L'y'))
+    {
+        beginEdit();
+        m_register.clear();
+        for (auto line = first; line <= last; ++line)
+        {
+            if (line > first) m_register += L'\n';
+            if (left < lineLength(line))
+                m_register += lineText(line).substr(left, right - left + 1);
+        }
+        m_lastYankLineWise = false;
+        if (k.ch != L'y')
+            for (auto line = last + 1; line-- > first;)
+                if (left < lineLength(line))
+                    m_text.erase(lineStart(line) + left, std::min(right + 1, lineLength(line)) - left);
+        m_mode = Mode::Normal;
+        m_cursor = {first, left};
+        clampCursor();
+        endEdit();
+        syncCursorAndSelection();
+        return;
+    }
+    if (k.name == KeyName::Esc || (k.name == KeyName::Char && (k.ch == L'v' || k.ch == L'V' || k.ch == L'o')))
+    {
+        handleVisual(k);
+        return;
+    }
+    if (k.name == KeyName::Char && k.ch >= L'1' && k.ch <= L'9')
+    {
+        m_count = m_countActive ? std::min(9999, m_count * 10 + int(k.ch - L'0')) : int(k.ch - L'0');
+        m_countActive = true;
+        return;
+    }
+    auto target = motionApply(m_cursor, k, m_countActive ? m_count : 1, m_countActive);
+    if (target.line != m_cursor.line)
+        target.col = m_cursor.col;
+    m_cursor = target;
+    m_desiredCol = target.col;
+    m_count = 1;
+    m_countActive = false;
+    syncCursorAndSelection();
+}
+
 void VimEditor::handleVisual(const Key& k)
 {
     if (k.name == KeyName::Esc)
@@ -1967,6 +2179,15 @@ void VimEditor::handleVisual(const Key& k)
         case L'i': case L'a':
             resetCount();
             m_object = k.ch == L'i' ? Object::InnerWord : Object::AWord;
+            return;
+        case L'r':
+            // v/V + r: the replacement character arrives on the next key, which
+            // handlePending() applies over the whole range as one undo step. The
+            // range is read back from the anchor and the head, neither of which
+            // moves in between.
+            m_count = count;
+            m_countActive = count > 1;
+            m_pending = Pending::VisualReplace;
             return;
         case L'%':
         {
@@ -2069,9 +2290,56 @@ void VimEditor::key(const Key& k)
 
 void VimEditor::dispatch(const Key& k)
 {
+    if (m_commandMode)
+    {
+        if (k.name == KeyName::Esc)
+        {
+            m_commandMode = false;
+            syncCursorAndSelection();
+        }
+        else if (k.name == KeyName::Enter)
+        {
+            m_commandMode = false;
+            executeCommand();
+        }
+        else
+        {
+            if (k.name == KeyName::Backspace && !m_command.empty()) m_command.pop_back();
+            else if (k.name == KeyName::Char && !k.ctrl) m_command += k.ch;
+            m_doc.setStatus((L":" + m_command).c_str());
+        }
+        return;
+    }
+    if (k.name == KeyName::Char && k.ctrl && (k.ch == L'q' || k.ch == L'v')
+        && m_mode != Mode::Insert && m_mode != Mode::Replace)
+    {
+        if (m_mode == Mode::Normal) m_visualAnchor = m_cursor;
+        m_mode = m_mode == Mode::VisualBlock ? Mode::Normal : Mode::VisualBlock;
+        syncCursorAndSelection();
+        return;
+    }
+    // A pending f/F/t/T/r/gg eats the next key, ':' included: "f:" searches for
+    // a colon, exactly like vim. Order matters, so this sits before the command
+    // line check below.
     if (m_pending != Pending::None)
     {
         handlePending(k);
+        return;
+    }
+    if (!m_runningCommand && k.name == KeyName::Char && k.ch == L':' && !k.ctrl
+        && m_mode != Mode::Insert && m_mode != Mode::Replace)
+    {
+        m_commandFirst = m_commandLast = m_cursor.line;
+        if (m_mode != Mode::Normal)
+        {
+            m_commandFirst = std::min(m_cursor.line, m_visualAnchor.line);
+            m_commandLast = std::max(m_cursor.line, m_visualAnchor.line);
+        }
+        m_mode = Mode::Normal;
+        m_commandMode = true;
+        m_command.clear();
+        syncCursorAndSelection();
+        m_doc.setStatus(L":");
         return;
     }
     if (m_object != Object::None)
@@ -2129,7 +2397,184 @@ void VimEditor::dispatch(const Key& k)
     case Mode::Replace: handleReplace(k); break;
     case Mode::Visual:
     case Mode::VisualLine: handleVisual(k); break;
+    case Mode::VisualBlock: handleBlock(k); break;
     }
+}
+
+void VimEditor::executeCommand()
+{
+    std::wstring command = m_command;
+    {
+        // :q / :q! — the core has no window, so it records the request and lets
+        // the host decide (the rename plugin closes its own window).
+        std::wstring trimmed = command;
+        while (!trimmed.empty() && trimmed.front() == L' ') trimmed.erase(0, 1);
+        if (trimmed == L"q" || trimmed == L"quit")
+        {
+            m_quitRequest = QuitRequest::Plain;
+            m_doc.setStatus(L"");
+            return;
+        }
+        if (trimmed == L"q!" || trimmed == L"quit!")
+        {
+            m_quitRequest = QuitRequest::Force;
+            m_doc.setStatus(L"");
+            return;
+        }
+    }
+    auto first = m_commandFirst;
+    auto last = m_commandLast;
+    if (!command.empty() && command.front() == L'%')
+    {
+        first = 0;
+        last = lineCount() - 1;
+        command.erase(0, 1);
+    }
+    std::optional<std::wregex> pattern;
+    bool inverse = false;
+    if (command.starts_with(L"g/") || command.starts_with(L"v/"))
+    {
+        inverse = command.front() == L'v';
+        const auto end = command.find(L'/', 2);
+        if (end == std::wstring::npos) { m_doc.setStatus(L"Missing pattern delimiter"); return; }
+        try { pattern.emplace(command.substr(2, end - 2)); }
+        catch (const std::regex_error&) { m_doc.setStatus(L"Invalid pattern"); return; }
+        first = 0;
+        last = lineCount() - 1;
+        command.erase(0, end + 1);
+    }
+    while (!command.empty() && command.front() == L' ') command.erase(0, 1);
+    if (command.size() >= 4 && command.front() == L's')
+    {
+        const wchar_t delimiter = command[1];
+        const auto patternEnd = command.find(delimiter, 2);
+        const auto replacementEnd = patternEnd == std::wstring::npos
+            ? std::wstring::npos : command.find(delimiter, patternEnd + 1);
+        if (patternEnd == std::wstring::npos || patternEnd == 2
+            || replacementEnd == std::wstring::npos)
+        {
+            m_doc.setStatus(L"Usage: :s/pattern/replacement/[gi]");
+            return;
+        }
+        const std::wstring expression = command.substr(2, patternEnd - 2);
+        const std::wstring replacement = command.substr(patternEnd + 1,
+                                                         replacementEnd - patternEnd - 1);
+        const std::wstring flags = command.substr(replacementEnd + 1);
+        const bool global = flags.find(L'g') != std::wstring::npos;
+        std::regex_constants::syntax_option_type options = std::regex_constants::ECMAScript;
+        if (flags.find(L'i') != std::wstring::npos)
+            options |= std::regex_constants::icase;
+        std::wregex substitution;
+        try { substitution = std::wregex(expression, options); }
+        catch (const std::regex_error&) { m_doc.setStatus(L"Invalid pattern"); return; }
+
+        std::wstring replacementFormat;
+        for (std::size_t i = 0; i < replacement.size(); ++i)
+        {
+            if (replacement[i] == L'\\' && i + 1 < replacement.size()
+                && replacement[i + 1] >= L'1' && replacement[i + 1] <= L'9')
+            {
+                replacementFormat += L'$';
+                replacementFormat += replacement[++i];
+            }
+            else
+                replacementFormat += replacement[i];
+        }
+
+        if (first > last || first >= lineCount())
+        {
+            m_doc.setStatus(L"No lines to substitute");
+            return;
+        }
+        last = std::min(last, lineCount() - 1);
+        std::vector<std::wstring> lines;
+        std::size_t lineStart = 0;
+        while (lineStart <= m_text.size())
+        {
+            const auto lineEnd = m_text.find(L'\n', lineStart);
+            lines.push_back(m_text.substr(lineStart,
+                                           lineEnd == std::wstring::npos
+                                               ? std::wstring::npos : lineEnd - lineStart));
+            if (lineEnd == std::wstring::npos)
+                break;
+            lineStart = lineEnd + 1;
+        }
+
+        std::size_t substitutions = 0;
+        for (std::size_t line = first; line <= last; ++line)
+        {
+            const auto begin = std::wsregex_iterator(lines[line].begin(), lines[line].end(), substitution);
+            const auto end = std::wsregex_iterator();
+            const auto matches = static_cast<std::size_t>(std::distance(begin, end));
+            substitutions += global ? matches : (matches > 0 ? 1u : 0u);
+            if (begin != end)
+                lines[line] = std::regex_replace(lines[line], substitution, replacementFormat,
+                    global ? std::regex_constants::format_default
+                           : std::regex_constants::format_first_only);
+        }
+        if (substitutions == 0)
+        {
+            m_doc.setStatus(L"Pattern not found");
+            return;
+        }
+
+        std::wstring updated;
+        for (std::size_t i = 0; i < lines.size(); ++i)
+        {
+            if (i != 0) updated += L'\n';
+            updated += lines[i];
+        }
+        beginEdit();
+        m_text = std::move(updated);
+        flushEdit();
+        endEdit();
+        syncCursorAndSelection();
+        m_doc.setStatus((std::to_wstring(substitutions) + L" substitutions").c_str());
+        return;
+    }
+    std::wstring keys;
+    if (command.starts_with(L"normal ")) keys = command.substr(7);
+    else if (command.starts_with(L"norm ")) keys = command.substr(5);
+    else if (command.starts_with(L"normal! ")) keys = command.substr(8);
+    else if (command.starts_with(L"norm! ")) keys = command.substr(6);
+    else if (command == L"d" || command == L"delete") keys = L"dd";
+    else { m_doc.setStatus(L"Supported: s/pattern/replacement/g, norm, g/pattern/norm, g/pattern/d"); return; }
+    const Snapshot before{m_text, m_cursor};
+    const auto undoSize = m_undo.size();
+    std::vector<std::size_t> rows;
+    for (auto line = first; line <= last; ++line)
+        if (!pattern || (std::regex_search(lineText(line), *pattern) != inverse)) rows.push_back(line);
+    std::ptrdiff_t shift = 0;
+    m_runningCommand = true;
+    for (const auto row : rows)
+    {
+        const auto target = static_cast<std::ptrdiff_t>(row) + shift;
+        if (target < 0 || static_cast<std::size_t>(target) >= lineCount()) continue;
+        const auto oldCount = lineCount();
+        m_cursor = {static_cast<std::size_t>(target), 0};
+        m_mode = Mode::Normal;
+        m_pending = Pending::None;
+        m_operator = L'\0';
+        m_countActive = false;
+        for (const auto ch : keys) dispatch(makeChar(ch));
+        dispatch(makeKey(KeyName::Esc));
+        shift += static_cast<std::ptrdiff_t>(lineCount()) - static_cast<std::ptrdiff_t>(oldCount);
+    }
+    m_runningCommand = false;
+    if (m_text != before.text)
+    {
+        if (m_undo.size() > undoSize) m_undo.resize(undoSize);
+        m_undo.push_back(before);
+        m_redo.clear();
+    }
+    syncCursorAndSelection();
+}
+
+QuitRequest VimEditor::takeQuitRequest()
+{
+    const QuitRequest request = m_quitRequest;
+    m_quitRequest = QuitRequest::None;
+    return request;
 }
 
 } // namespace vimcore
