@@ -11,7 +11,7 @@ mode is the first user), but it depends on nothing from Win顺.
 ## Integrate
 
 ```
-git submodule add https://github.com/ra9fael/winshun-vimcore vendor/vimcore
+git submodule add https://github.com/ra9fael/vimcore vendor/vimcore
 ```
 
 ```cmake
